@@ -805,7 +805,13 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // char padding[4];
+        // NUMA mirror: when non-NULL, points to a struct ggml_numa_mirror holding one
+        // node-local copy of this tensor's data per NUMA node (see ggml_numa_tensor_data).
+        // NULL for the vast majority of tensors (the "not mirrored" sentinel).
+        void * data_numa;
+
+        // keep sizeof(struct ggml_tensor) a multiple of GGML_MEM_ALIGN (data_numa added 8 bytes)
+        char padding[8];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -872,6 +878,9 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
+    // maximum number of NUMA nodes ggml will track / mirror across
+    #define GGML_NUMA_MAX_NODES 8
+
     // numa strategies
     enum ggml_numa_strategy {
         GGML_NUMA_STRATEGY_DISABLED   = 0,
@@ -880,6 +889,15 @@ extern "C" {
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
         GGML_NUMA_STRATEGY_COUNT
+    };
+
+    // which read-mostly data to duplicate per NUMA node when GGML_NUMA_STRATEGY_MIRROR is active.
+    // these are bit flags so they can be OR-ed together (see ggml_numa_set_mirror).
+    enum ggml_numa_mirror_flags {
+        GGML_NUMA_MIRROR_WEIGHTS     = 1 << 0, // model weight tensors
+        GGML_NUMA_MIRROR_KV          = 1 << 1, // K/V cache
+        GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // per-node matmul scratch / work buffers
+        GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV | GGML_NUMA_MIRROR_ACTIVATIONS,
     };
 
     //
@@ -905,6 +923,21 @@ extern "C" {
 
     GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+
+    // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
+    GGML_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)
+    GGML_API bool     ggml_numa_mirror_active(void);               // true if strategy == MIRROR and >1 node
+    GGML_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
+    GGML_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
+    GGML_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
+    // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
+    GGML_API void *   ggml_numa_alloc(size_t size, int node);
+    GGML_API void     ggml_numa_free(void * ptr, size_t size);
+    // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE)
+    GGML_API void     ggml_numa_bind(void * ptr, size_t size, int node);
+    // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.
+    GGML_API void     ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data);
+    GGML_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);

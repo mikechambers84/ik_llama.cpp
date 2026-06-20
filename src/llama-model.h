@@ -482,6 +482,15 @@ struct llama_model {
     // the model memory buffers for the tensor data
     std::vector<ggml_backend_buffer_t> bufs;
 
+    // NUMA mirror: per-(host weight buffer) node-local copies. node_base[0] aliases the original
+    // buffer; node_base[1..n-1] are extra copies allocated with ggml_numa_alloc and freed here.
+    struct numa_mirror_buffer {
+        ggml_backend_buffer_t buf;
+        size_t size;
+        void * node_base[GGML_NUMA_MAX_NODES];
+    };
+    mutable std::vector<numa_mirror_buffer> numa_mirror_bufs;
+
     // model memory mapped files
     llama_mmaps mappings;
 

@@ -2200,7 +2200,28 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
         else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
         else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+        else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
         else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--numa-mirror") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        params.numa = GGML_NUMA_STRATEGY_MIRROR; // selecting components implies mirror mode
+        uint32_t mask = 0;
+        std::stringstream ss(value);
+        std::string item;
+        bool ok = true;
+        while (std::getline(ss, item, ',')) {
+            /**/ if (item == "all")         { mask |= GGML_NUMA_MIRROR_ALL; }
+            else if (item == "none")        { mask  = 0; }
+            else if (item == "weights")     { mask |= GGML_NUMA_MIRROR_WEIGHTS; }
+            else if (item == "kv")          { mask |= GGML_NUMA_MIRROR_KV; }
+            else if (item == "activations") { mask |= GGML_NUMA_MIRROR_ACTIVATIONS; }
+            else { ok = false; }
+        }
+        if (!ok) { invalid_param = true; return true; }
+        params.numa_mirror = mask;
         return true;
     }
     if (arg == "-dev" || arg == "--device") {
@@ -3215,8 +3236,12 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - distribute: spread execution evenly over all nodes\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
+                                                                        "  - mirror: duplicate model weights/KV per NUMA node so each node reads only local memory.\n"
+                                                                        "            pins threads per node and uses N x RAM (N = number of NUMA nodes). implies --no-mmap.\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
+    options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
+                                                                        "  weights, kv, activations, all, none (default: all). implies --numa mirror" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -3928,6 +3953,12 @@ std::string fs_get_cache_file(const std::string & filename) {
 
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
+
+    // apply any --numa-mirror component customization before the model / context are built
+    // (ggml_numa_init already defaulted this to "all" when --numa mirror was selected).
+    if (params.numa == GGML_NUMA_STRATEGY_MIRROR) {
+        ggml_numa_set_mirror(params.numa_mirror);
+    }
 
     auto mparams = common_model_params_to_llama(params);
 
