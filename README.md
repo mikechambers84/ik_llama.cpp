@@ -63,9 +63,12 @@ here, so it isn't included.) `mirror` keeps a full local copy of the weights and
 
 ## Test setup
 
-- **Hardware:** 2× Intel Xeon Gold 6248R (Cascade Lake), 2 NUMA nodes (24 physical cores /
-  48 threads each), 768 GB RAM (384 GB per node) ECC DDR4 2400 MHz, all 12 memory channels
-  populated. `numa_balancing` disabled.
+- **Operating System:**
+  - Debian 13 "Trixie" with `numa_balancing` disabled during benchmarking
+- **Hardware:**
+  - Model: Dell PowerEdge R740
+  - CPU: 2× Intel Xeon Gold 6248R (Cascade Lake), 2 NUMA nodes (24 cores /  48 threads each)
+  - RAM: 768 GB RAM (384 GB per node) ECC DDR4 2400 MHz, all 12 memory channels populated
 - **Build:** CPU backend, `Release`, `-DGGML_NATIVE=ON -DGGML_AVX512=ON
   -DGGML_AVX512_VNNI=ON`. (VBMI/BF16 are **not** enabled — Cascade Lake does not implement
   `avx512_vbmi` / `avx512_bf16`.)
