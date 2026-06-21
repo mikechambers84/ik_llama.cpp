@@ -1,3 +1,56 @@
+# NUMA-mirrored ik_llama.cpp
+
+This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — itself a
+performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) (see the
+original README below) — that adds a **`--numa mirror`** mode for fast CPU inference on
+multi-socket / multi-NUMA-node servers.
+
+## What it does
+
+On a multi-socket machine, plain CPU inference scales poorly: the model weights live on one
+NUMA node, so threads running on another socket read them *remotely* over the inter-socket
+link (UPI / Infinity Fabric). That cross-socket traffic becomes the bottleneck — adding the
+second socket's cores often gives little speedup, and can even make **token generation
+slower** than using a single socket.
+
+`--numa mirror` fixes this by keeping one **full, node-local copy** of the read-mostly data
+on **every NUMA node**:
+
+- **Model weights** are duplicated once per node.
+- **The KV cache** is duplicated once per node (writes are replicated to all copies; reads
+  stay local).
+- **Inference threads are pinned per node** and only ever touch their node-local copies, so
+  no model data is read across the inter-socket link.
+- A **NUMA-aware hierarchical barrier** keeps the per-op thread synchronization (otherwise a
+  major cross-socket cost during token generation) from becoming the new bottleneck.
+
+Each socket then runs at its full *local* memory bandwidth, so a multi-socket box can
+actually put all of its sockets to work. The gain is largest for **token generation**
+(memory-bandwidth bound) and more modest for prompt processing (compute bound).
+
+The trade-off is memory: mirroring uses **N× RAM** (N = number of NUMA nodes), so the model
+has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`.
+
+## How to use it
+
+```
+# auto-detect the NUMA nodes and mirror weights + KV across all of them
+./build/bin/llama-cli -m model.gguf --numa mirror -t <total physical cores> -p "..."
+```
+
+- Works in every tool that supports `--numa` (`llama-cli`, `llama-server`, `llama-bench`, …).
+- `--numa-mirror <list>` selects *what* to mirror: `weights`, `kv`, `all` (default) or
+  `none` — e.g. `--numa-mirror weights` to mirror only the weights.
+- **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
+  For best results, disable kernel auto-balancing:
+  `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
+- **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
+  physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
+
+See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
+
+---
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
