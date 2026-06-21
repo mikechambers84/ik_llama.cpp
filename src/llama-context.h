@@ -74,6 +74,15 @@ struct llama_kv_cache {
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
 
+    // NUMA mirror: per-(host KV buffer) node-local copies. node_base[0] aliases the original
+    // buffer; node_base[1..n-1] are extra copies from ggml_numa_alloc, freed in the destructor.
+    struct numa_mirror_buffer {
+        ggml_backend_buffer_t buf;
+        size_t size;
+        void * node_base[GGML_NUMA_MAX_NODES];
+    };
+    std::vector<numa_mirror_buffer> numa_mirror_bufs;
+
     size_t total_size() const {
         size_t size = 0;
         for (ggml_backend_buffer_t buf : bufs) {
@@ -155,6 +164,18 @@ struct llama_kv_cache {
     bool per_step_restore(const llama_model & model, ggml_backend_sched_t sched, int step);
 
     ~llama_kv_cache() {
+        // release NUMA mirror per-tensor pointer tables and the extra node-local KV copies
+        for (struct ggml_context * ctx : ctxs) {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                ggml_numa_tensor_clear_mirror(t);
+            }
+        }
+        for (auto & mb : numa_mirror_bufs) {
+            for (int n = 1; n < ggml_numa_node_count(); ++n) { // node_base[0] aliases the original buffer
+                ggml_numa_free(mb.node_base[n], mb.size);
+            }
+        }
+        numa_mirror_bufs.clear();
         for (struct ggml_context * ctx : ctxs) {
             ggml_free(ctx);
         }

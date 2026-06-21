@@ -4846,6 +4846,45 @@ void ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor) {
     }
 }
 
+// NUMA mirror (KV cache): after a cpy/dup has written node 0's copy of a mirrored KV tensor view,
+// replicate the freshly written rows to every other node's copy, so each node's attention reads
+// valid node-local K/V. No-op for any tensor that isn't a mirrored KV destination.
+static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    // walk the view chain to find the mirrored base tensor (the k_l / v_l cache tensor)
+    const struct ggml_tensor * t = dst;
+    struct ggml_numa_mirror * m = NULL;
+    while (t) {
+        if (t->data_numa) { m = (struct ggml_numa_mirror *) t->data_numa; break; }
+        t = t->view_src;
+    }
+    if (!m) {
+        return;
+    }
+    const int nodes = ggml_numa_node_count();
+    if (nodes < 2) {
+        return;
+    }
+    // make sure node 0's copy is fully written before we read it to replicate
+    ggml_barrier(params->shared);
+
+    const int     ith   = params->ith;
+    const int     nth   = params->nth;
+    const size_t  run   = ggml_row_size(dst->type, dst->ne[0]); // contiguous bytes per dim-0 row
+    const int64_t n1    = dst->ne[1], n2 = dst->ne[2], n3 = dst->ne[3];
+    const int64_t nrows = n1*n2*n3;
+    const char *  base0 = (const char *) m->data[0]; // node 0 aliases the root tensor's data
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const int64_t i1 = r % n1;
+        const int64_t i2 = (r / n1) % n2;
+        const int64_t i3 = r / (n1*n2);
+        char * row0 = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
+        const size_t off = (size_t) (row0 - base0);
+        for (int n = 1; n < nodes; ++n) {
+            memcpy((char *) m->data[n] + off, row0, run);
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_print_object(const struct ggml_object * obj) {
@@ -12614,32 +12653,31 @@ static void ggml_compute_forward_dup(
 
     if (ggml_is_quantized(src0->type)) {
         ggml_compute_forward_dup_q(params, dst);
-        return;
-    }
-
-    if (src0->type == dst->type) {
+    } else if (src0->type == dst->type) {
         ggml_compute_forward_dup_bytes(params, dst);
-        return;
+    } else {
+        switch (src0->type) {
+            case GGML_TYPE_F16:
+                {
+                    ggml_compute_forward_dup_f16(params, dst);
+                } break;
+            case GGML_TYPE_BF16:
+                {
+                    ggml_compute_forward_dup_bf16(params, dst);
+                } break;
+            case GGML_TYPE_F32:
+                {
+                    ggml_compute_forward_dup_f32(params, dst);
+                } break;
+            default:
+                {
+                    GGML_ABORT("fatal error");
+                }
+        }
     }
 
-    switch (src0->type) {
-        case GGML_TYPE_F16:
-            {
-                ggml_compute_forward_dup_f16(params, dst);
-            } break;
-        case GGML_TYPE_BF16:
-            {
-                ggml_compute_forward_dup_bf16(params, dst);
-            } break;
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_dup_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
+    // NUMA mirror: if this dup wrote a mirrored KV-cache view, fan the new rows out to each node copy
+    ggml_numa_replicate_kv_write(params, dst);
 }
 
 // ggml_compute_forward_add
@@ -21976,6 +22014,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // NUMA mirror: read K/V from this thread's node-local copy (k/v are views of the mirrored
+    // k_l/v_l cache tensors; falls back to ->data when KV mirroring is inactive).
+    const int numa_node = ggml_numa_node_for_thread(ith, nth);
+    const void * const k_base = ggml_numa_tensor_data(k, numa_node);
+    const void * const v_base = ggml_numa_tensor_data(v, numa_node);
+
     const int64_t Dk = nek0;
     const int64_t Dv = nev0;
     const int64_t N  = neq1;
@@ -22041,7 +22085,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 dst->ne[2], dst->ne[1], dst->nb[1],
                 k->type, v->type,
                 Dk, Dv, neq1, nek1, q->nb[1], k->nb[1], v->nb[1], mask ? mask->nb[1] : 0,
-                q->data, k->data, v->data, mask ? mask->data : NULL, sinks ? sinks->data : NULL,
+                q->data, k_base, v_base, mask ? mask->data : NULL, sinks ? sinks->data : NULL,
                 scale, softcap, (float *)dst->data,
                 params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, ith, nth, dst->op_params[4])) return;
 
@@ -22151,7 +22195,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
             float s; // KQ value
 
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            const char * k_data = (const char *) k_base + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
             kq_vec_dot(Dk, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = softcap == 0.0f ? s*scale + mv : softcap*tanhf(s*scale) + mv; // scale KQ value and apply mask
@@ -22161,7 +22205,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data = ((const char *) v_base + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
