@@ -49,6 +49,98 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
 
 See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
 
+# NUMA mode benchmarks
+
+How much does **`--numa mirror`** speed up CPU inference on a dual-socket server, versus
+running on a single socket?
+
+The baseline here is `--numa isolate` (run entirely on one socket). When a model fits in a
+single NUMA node's RAM — which every model below does on this machine (384 GB/node) —
+`isolate` is the usual recommended mode, because it keeps all memory access node-local.
+(`--numa distribute` exists for models too large to fit in one node; that's not the case
+here, so it isn't included.) `mirror` keeps a full local copy of the weights and KV cache on
+*each* node, so both sockets can run while still reading only local memory.
+
+## Test setup
+
+- **Hardware:** 2× Intel Xeon Gold 6248R (Cascade Lake), 2 NUMA nodes (24 physical cores /
+  48 threads each), 768 GB RAM (384 GB per node) ECC DDR4 2400 MHz, all 12 memory channels
+  populated. `numa_balancing` disabled.
+- **Build:** CPU backend, `Release`, `-DGGML_NATIVE=ON -DGGML_AVX512=ON
+  -DGGML_AVX512_VNNI=ON`. (VBMI/BF16 are **not** enabled — Cascade Lake does not implement
+  `avx512_vbmi` / `avx512_bf16`.)
+- **Tool:** `llama-bench`, 3 repetitions per result (`-r 3`).
+- **Per-run flags:** `-rtr 1 -b 16 -ub 16 -p 512 -n 128` (run-time repacking on; batch and
+  micro-batch 16; `pp512` = prompt processing of 512 tokens, `tg128` = generation of 128).
+- **Modes compared** (threads set equal for `-t`/`-tb`):
+  - `isolate` — `--numa isolate -t 24 -tb 24` (one socket / 24 cores) — single-socket baseline
+  - `mirror`  — `--numa mirror  -t 48 -tb 48` (both sockets, weights + KV duplicated per node)
+
+All throughput numbers are tokens/second (higher is better).
+
+## Token generation (tg128)
+
+| Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
+|---|--:|--:|--:|
+| gemma-4-E2B (5.05B dense, Q5_K_M) | 47.20 | **62.00** | 1.31× |
+| gemma-4-E4B (8.19B dense, Q5_K_M) | 23.77 | **33.62** | 1.41× |
+| gemma-4-26B-A4B (MoE, Q4_K_M) | 23.59 | **34.76** | 1.47× |
+| Qwen3.6-27B (26.9B dense, Q4_K_M) | 5.27 | **8.32** | 1.58× |
+| Qwen3.6-35B-A3B (MoE, Q5_K_M) | 24.70 | **31.56** | 1.28× |
+| Qwen3.5-122B-A10B (MoE, Q3_K_XL) | 10.00 | **14.46** | 1.45× |
+
+## Prompt processing (pp512)
+
+| Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
+|---|--:|--:|--:|
+| gemma-4-E2B (5.05B dense, Q5_K_M) | 259.90 | **256.69** | 0.99× |
+| gemma-4-E4B (8.19B dense, Q5_K_M) | 141.88 | **184.06** | 1.30× |
+| gemma-4-26B-A4B (MoE, Q4_K_M) | 143.41 | **201.69** | 1.41× |
+| Qwen3.6-27B (26.9B dense, Q4_K_M) | 33.04 | **54.22** | 1.64× |
+| Qwen3.6-35B-A3B (MoE, Q5_K_M) | 153.68 | **193.21** | 1.26× |
+| Qwen3.5-122B-A10B (MoE, Q3_K_XL) | 57.17 | **83.01** | 1.45× |
+
+## Takeaways
+
+- **`mirror` puts the second socket to work.** Across dense and MoE models (3.4 GB → 53 GB),
+  it beats a single socket on every model for both metrics — the lone exception being prompt
+  processing on the tiny 3.4 GB gemma-E2B, where one socket already saturates and the two are
+  effectively tied.
+- **Token generation: ~1.3–1.6× `isolate`.** TG is memory-bandwidth bound; mirroring lets
+  each socket pull from its own local memory, so aggregate bandwidth (and throughput) scales
+  with the second socket instead of being capped by it.
+- **Prompt processing: ~1.0–1.65× `isolate`.** PP is more compute-bound (it amortizes weight
+  reads across the batch), so the gain is generally smaller than TG, but still a solid win on
+  the larger models where there's enough work to feed both sockets.
+- **The dense model gains the most.** Qwen3.6-27B (the only non-MoE here) sees the biggest
+  speedups (TG 1.58×, PP 1.64×): a dense model reads *all* of its weights every token, so
+  it's the most bandwidth-bound and benefits most from each socket reading local memory. MoE
+  models read only their active experts per token, so they're less bandwidth-bound per token
+  and the gain, while still large, is a bit smaller.
+- **Trade-off:** `mirror` keeps one copy of the weights + KV cache per NUMA node, i.e.
+  **N× RAM** (here 2×). It's the right mode when the model fits a node's RAM with room to
+  spare; if it doesn't, that's the case `--numa distribute` is for.
+
+### Raw `llama-bench` output
+
+Each run used `-rtr 1 -b 16 -ub 16 -p 512 -n 128 -r 3` with the mode-specific `--numa` and
+`-t` settings above.
+
+| Model | Mode | pp512 (t/s) | tg128 (t/s) |
+|---|---|--:|--:|
+| gemma-4-E2B | isolate | 259.90 ± 5.94 | 47.20 ± 0.01 |
+| gemma-4-E2B | mirror | 256.69 ± 7.32 | 62.00 ± 0.13 |
+| gemma-4-E4B | isolate | 141.88 ± 0.86 | 23.77 ± 0.05 |
+| gemma-4-E4B | mirror | 184.06 ± 8.21 | 33.62 ± 0.21 |
+| gemma-4-26B-A4B | isolate | 143.41 ± 1.42 | 23.59 ± 0.00 |
+| gemma-4-26B-A4B | mirror | 201.69 ± 30.30 | 34.76 ± 0.68 |
+| Qwen3.6-27B | isolate | 33.04 ± 0.17 | 5.27 ± 0.00 |
+| Qwen3.6-27B | mirror | 54.22 ± 0.73 | 8.32 ± 0.02 |
+| Qwen3.6-35B-A3B | isolate | 153.68 ± 1.33 | 24.70 ± 0.01 |
+| Qwen3.6-35B-A3B | mirror | 193.21 ± 4.91 | 31.56 ± 0.08 |
+| Qwen3.5-122B-A10B | isolate | 57.17 ± 0.10 | 10.00 ± 0.00 |
+| Qwen3.5-122B-A10B | mirror | 83.01 ± 1.32 | 14.46 ± 0.01 |
+
 ---
 
 # ik_llama.cpp: llama.cpp fork with better CPU performance
