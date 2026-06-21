@@ -115,11 +115,6 @@ All throughput numbers are tokens/second (higher is better).
 - **Prompt processing: ~1.0–1.65× `isolate`.** PP is more compute-bound (it amortizes weight
   reads across the batch), so the gain is generally smaller than TG, but still a solid win on
   the larger models where there's enough work to feed both sockets.
-- **The dense model gains the most.** Qwen3.6-27B (the only non-MoE here) sees the biggest
-  speedups (TG 1.58×, PP 1.64×): a dense model reads *all* of its weights every token, so
-  it's the most bandwidth-bound and benefits most from each socket reading local memory. MoE
-  models read only their active experts per token, so they're less bandwidth-bound per token
-  and the gain, while still large, is a bit smaller.
 - **Trade-off:** `mirror` keeps one copy of the weights + KV cache per NUMA node, i.e.
   **N× RAM** (here 2×). It's the right mode when the model fits a node's RAM with room to
   spare; if it doesn't, that's the case `--numa distribute` is for.
