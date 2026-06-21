@@ -85,23 +85,23 @@ All throughput numbers are tokens/second (higher is better).
 
 | Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
 |---|--:|--:|--:|
-| gemma-4-E2B (5.05B dense, Q5_K_M) | 47.20 | **62.00** | 1.31× |
-| gemma-4-E4B (8.19B dense, Q5_K_M) | 23.77 | **33.62** | 1.41× |
-| gemma-4-26B-A4B (MoE, Q4_K_M) | 23.59 | **34.76** | 1.47× |
-| Qwen3.6-27B (26.9B dense, Q4_K_M) | 5.27 | **8.32** | 1.58× |
-| Qwen3.6-35B-A3B (MoE, Q5_K_M) | 24.70 | **31.56** | 1.28× |
-| Qwen3.5-122B-A10B (MoE, Q3_K_XL) | 10.00 | **14.46** | 1.45× |
+| gemma-4-E2B (dense, Q5_K_M) | 47.20 | **62.00** | 1.31× |
+| gemma-4-E4B (dense, Q5_K_M) | 23.77 | **33.62** | 1.41× |
+| gemma-4-26B-A4B (MoE, UD-Q4_K_M) | 23.59 | **34.76** | 1.47× |
+| Qwen3.6-27B (dense, Q4_K_M) | 5.27 | **8.32** | 1.58× |
+| Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 24.70 | **31.56** | 1.28× |
+| Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 10.00 | **14.46** | 1.45× |
 
 ## Prompt processing (pp512)
 
 | Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
 |---|--:|--:|--:|
-| gemma-4-E2B (5.05B dense, Q5_K_M) | 259.90 | **256.69** | 0.99× |
-| gemma-4-E4B (8.19B dense, Q5_K_M) | 141.88 | **184.06** | 1.30× |
-| gemma-4-26B-A4B (MoE, Q4_K_M) | 143.41 | **201.69** | 1.41× |
-| Qwen3.6-27B (26.9B dense, Q4_K_M) | 33.04 | **54.22** | 1.64× |
-| Qwen3.6-35B-A3B (MoE, Q5_K_M) | 153.68 | **193.21** | 1.26× |
-| Qwen3.5-122B-A10B (MoE, Q3_K_XL) | 57.17 | **83.01** | 1.45× |
+| gemma-4-E2B (dense, Q5_K_M) | 259.90 | **256.69** | 0.99× |
+| gemma-4-E4B (dense, Q5_K_M) | 141.88 | **184.06** | 1.30× |
+| gemma-4-26B-A4B (MoE, UD-Q4_K_M) | 143.41 | **201.69** | 1.41× |
+| Qwen3.6-27B (dense, Q4_K_M) | 33.04 | **54.22** | 1.64× |
+| Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 153.68 | **193.21** | 1.26× |
+| Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 57.17 | **83.01** | 1.45× |
 
 ## Takeaways
 
