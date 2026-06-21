@@ -896,8 +896,8 @@ extern "C" {
     enum ggml_numa_mirror_flags {
         GGML_NUMA_MIRROR_WEIGHTS     = 1 << 0, // model weight tensors
         GGML_NUMA_MIRROR_KV          = 1 << 1, // K/V cache
-        GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // per-node matmul scratch / work buffers
-        GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV | GGML_NUMA_MIRROR_ACTIVATIONS,
+        GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // reserved: per-node matmul scratch (not implemented)
+        GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV,
     };
 
     //

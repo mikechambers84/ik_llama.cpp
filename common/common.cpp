@@ -2217,7 +2217,6 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             else if (item == "none")        { mask  = 0; }
             else if (item == "weights")     { mask |= GGML_NUMA_MIRROR_WEIGHTS; }
             else if (item == "kv")          { mask |= GGML_NUMA_MIRROR_KV; }
-            else if (item == "activations") { mask |= GGML_NUMA_MIRROR_ACTIVATIONS; }
             else { ok = false; }
         }
         if (!ok) { invalid_param = true; return true; }
@@ -3241,7 +3240,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
-                                                                        "  weights, kv, activations, all, none (default: all). implies --numa mirror" });
+                                                                        "  weights, kv, all, none (default: all). implies --numa mirror" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",

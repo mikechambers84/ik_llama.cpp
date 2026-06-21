@@ -4795,14 +4795,15 @@ struct ggml_numa_mirror {
 
 // hot path: return the caller-thread's node-local copy of a (possibly view) tensor's data,
 // or its plain ->data when the tensor is not mirrored. data_numa == NULL for ~all tensors.
-static inline const void * ggml_numa_tensor_data(const struct ggml_tensor * t, int node) {
+// Returns void* (like tensor->data) so call sites cast exactly as they did for ->data.
+static inline void * ggml_numa_tensor_data(const struct ggml_tensor * t, int node) {
     if (t->data_numa) {
         void * d = ((const struct ggml_numa_mirror *) t->data_numa)->data[node];
         return d ? d : t->data;
     }
     if (t->view_src && t->view_src->data_numa) {
         void * d = ((const struct ggml_numa_mirror *) t->view_src->data_numa)->data[node];
-        if (d) return (const char *) d + t->view_offs;
+        if (d) return (char *) d + t->view_offs;
     }
     return t->data;
 }
@@ -19080,7 +19081,7 @@ static void ggml_compute_forward_get_rows_f32(
         if (i01 >= 0 && i01 < ne01) {
             ggml_vec_cpy_f32(nc,
                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                    (float *) ((const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(params->ith, params->nth)) + i01*nb01 + i11*nb02 + i12*nb03));
+                    (float *) ((char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(params->ith, params->nth)) + i01*nb01 + i11*nb02 + i12*nb03));
         } else {
             memset((char *)dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
         }
