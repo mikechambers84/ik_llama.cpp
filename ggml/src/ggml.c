@@ -45,6 +45,13 @@
 
 #define IK_PRINT_TIMING 0
 
+// portable thread-local storage class (GCC/Clang use __thread, MSVC C uses __declspec(thread))
+#if defined(_MSC_VER)
+#define GGML_THREAD_LOCAL __declspec(thread)
+#else
+#define GGML_THREAD_LOCAL __thread
+#endif
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -4552,7 +4559,7 @@ static struct {
     int active;
 } g_numa_barrier;
 
-static __thread int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
+static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
 
 static inline void ggml_numa_spin_pause(void) {
 #if defined(__SSE3__)
@@ -4796,14 +4803,16 @@ struct ggml_numa_mirror {
 // hot path: return the caller-thread's node-local copy of a (possibly view) tensor's data,
 // or its plain ->data when the tensor is not mirrored. data_numa == NULL for ~all tensors.
 // Returns void* (like tensor->data) so call sites cast exactly as they did for ->data.
+// Walks the view_src chain so views-of-views still resolve to node-local memory; in practice
+// this is only ever called on src0 weights (direct -> returns on iteration 1) and KV reads
+// (one-level views), so the loop is <=2 and adds no measurable hot-path cost.
 static inline void * ggml_numa_tensor_data(const struct ggml_tensor * t, int node) {
-    if (t->data_numa) {
-        void * d = ((const struct ggml_numa_mirror *) t->data_numa)->data[node];
-        return d ? d : t->data;
-    }
-    if (t->view_src && t->view_src->data_numa) {
-        void * d = ((const struct ggml_numa_mirror *) t->view_src->data_numa)->data[node];
-        if (d) return (char *) d + t->view_offs;
+    for (const struct ggml_tensor * a = t; a; a = a->view_src) {
+        if (a->data_numa) {
+            void * base = ((const struct ggml_numa_mirror *) a->data_numa)->data[node];
+            // offset from the already-resolved pointers (t->data == a->data + accumulated view offs)
+            return base ? (char *) base + ((const char *) t->data - (const char *) a->data) : t->data;
+        }
     }
     return t->data;
 }
@@ -4931,6 +4940,16 @@ static void ggml_numa_barrier_setup(int n_threads) {
             // node-local so the intra-node sync never crosses the interconnect (mmap is zeroed)
             g_numa_barrier.node[k] = (struct ggml_numa_barrier_node *)
                 ggml_numa_alloc(sizeof(struct ggml_numa_barrier_node), k);
+            if (g_numa_barrier.node[k] == NULL) {
+                // allocation failed: undo and fall back to the flat barrier instead of risking
+                // a NULL deref in ggml_numa_hier_barrier()
+                for (int j = 0; j < k; ++j) {
+                    ggml_numa_free(g_numa_barrier.node[j], sizeof(struct ggml_numa_barrier_node));
+                    g_numa_barrier.node[j] = NULL;
+                }
+                g_numa_barrier.active = 0;
+                return;
+            }
         }
         atomic_store(&g_numa_barrier.global_arrive, 0);
         atomic_store(&g_numa_barrier.global_release, 0);
@@ -4968,6 +4987,23 @@ void ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor) {
     if (tensor->data_numa) {
         free(tensor->data_numa);
         tensor->data_numa = NULL;
+    }
+}
+
+// Cold path only (state restore, K-shift, cache clear): re-copy node 0's bytes into every
+// other node copy of a mirrored tensor, so writes that bypass the graph CPY replication don't
+// leave stale node-local data. No-op when the tensor isn't mirrored. Not on any per-token path.
+void ggml_numa_tensor_resync(struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->data_numa) {
+        return;
+    }
+    struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) tensor->data_numa;
+    const int    nodes  = ggml_numa_node_count();
+    const size_t nbytes = ggml_nbytes(tensor);
+    for (int n = 1; n < nodes; ++n) { // node 0 aliases tensor->data
+        if (m->data[n] && m->data[n] != tensor->data) {
+            memcpy(m->data[n], tensor->data, nbytes);
+        }
     }
 }
 

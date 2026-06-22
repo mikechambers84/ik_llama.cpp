@@ -1786,6 +1786,13 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
     }
+    // ggml_backend_buffer_clear zeroes only node 0; mirror the zeroing to the other node copies
+    // (defensive — cleared cells are normally rewritten before re-read, but keep copies consistent)
+    if (!cache.numa_mirror_bufs.empty()) {
+        for (auto * t : cache.k_l) ggml_numa_tensor_resync(t);
+        for (auto * t : cache.v_l) ggml_numa_tensor_resync(t);
+        for (auto * t : cache.s_l) ggml_numa_tensor_resync(t);
+    }
 }
 
 static bool llama_kv_cache_seq_rm(
@@ -6136,6 +6143,15 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
 
+            // For non-quantized K, the K-shift rotates k_l *in place* (RoPE), bypassing the
+            // graph-CPY mirror replication, so the per-node copies keep the un-rotated K.
+            // Re-sync them. No-op when NUMA mirroring is off. (Cold path: only on context shift.)
+            if (!lctx.kv_self.numa_mirror_bufs.empty()) {
+                for (auto * t : lctx.kv_self.k_l) {
+                    ggml_numa_tensor_resync(t);
+                }
+            }
+
             need_reserve = true;
         }
 
@@ -6915,6 +6931,10 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache) {
         for (int n = 1; n < n_nodes; ++n) {
             void * p = ggml_numa_alloc(mb.size, n); // mmap(ANON) is zero-filled, matching the cleared buffer
             if (!p) { ok = false; break; }
+            // fault the pages now (and place them node-locally) so this allocation actually counts
+            // against MemAvailable; otherwise the weight-mirror RAM check can't see this reservation
+            // and combined over-subscription would surface as a mid-decode SIGBUS instead of here.
+            memset(p, 0, mb.size);
             mb.node_base[n] = p;
         }
         if (!ok) {
@@ -9295,6 +9315,14 @@ struct llama_data_read {
                     }
                 }
             }
+        }
+        // NUMA mirror: restore wrote node 0's KV copies directly (ggml_backend_tensor_set / split
+        // memcpy), bypassing graph-CPY replication — re-sync the other node copies so attention on
+        // node>0 reads the restored K/V, not stale/zero data. No-op when not mirroring.
+        if (!kv_self.numa_mirror_bufs.empty()) {
+            for (auto * t : kv_self.k_l) ggml_numa_tensor_resync(t);
+            for (auto * t : kv_self.v_l) ggml_numa_tensor_resync(t);
+            for (auto * t : kv_self.s_l) ggml_numa_tensor_resync(t);
         }
         return true;
     }

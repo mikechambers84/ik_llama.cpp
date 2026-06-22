@@ -38,9 +38,12 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
 ./build/bin/llama-cli -m model.gguf --numa mirror -t <total physical cores> -p "..."
 ```
 
-- Works in every tool that supports `--numa` (`llama-cli`, `llama-server`, `llama-bench`, …).
+- `--numa mirror` works in every tool that supports `--numa` (`llama-cli`, `llama-server`,
+  `llama-bench`, …).
 - `--numa-mirror <list>` selects *what* to mirror: `weights`, `kv`, `all` (default) or
-  `none` — e.g. `--numa-mirror weights` to mirror only the weights.
+  `none` — e.g. `--numa-mirror weights` to mirror only the weights. This component selector is
+  available in the main tools (`llama-cli`, `llama-server`, …); `llama-bench` accepts
+  `--numa mirror` only and always mirrors everything (`weights` + `kv`).
 - **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
   For best results, disable kernel auto-balancing:
   `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
