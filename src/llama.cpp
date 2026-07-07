@@ -691,7 +691,34 @@ bool llama_context::update_cache_copies() {
             }
         }
     }
+    // GLM-DSA lightning indexer: patch the indexer-key (kr_l) cache write offset for the reused
+    // graph. Each registered cpy writes this ubatch's index keys into kr_l at the kv_head slot;
+    // like the K/V copies above, its baked view_offs must be re-pointed to the CURRENT kv_head,
+    // else a reused graph (FA pad-256, constant n_kv) keeps writing to the first ubatch's slot and
+    // the recent indexer-key cells read uninitialized (scattered selection -> degraded/NaN decode).
+    // step = kr_l->nb[1] (one index-key row = head_size * F16). No-op when DSA is off (entries null).
+    for (size_t il = 0; il < dsa_cache_copies.size(); ++il) {
+        auto & c = dsa_cache_copies[il];
+        if (!c.cpy) continue;
+        // Sanity guard (the MSA fix omitted this): the registered cpy must still be a CPY whose
+        // destination view is rooted at this layer's kr_l cache (mirrors the K/V guard above,
+        // which checks c.cpy->view_src). If the graph was rebuilt with a different shape these no
+        // longer match, so refuse reuse and force a rebuild.
+        if (c.cpy->op != GGML_OP_CPY ||
+            il >= kv_self.kr_l.size() || kv_self.kr_l[il] == nullptr ||
+            c.cpy->view_src != kv_self.kr_l[il]) {
+            return false;
+        }
+        c.cpy->view_offs    = kv_self.head * c.step;
+        c.cpy->src[1]->data = (char *) kv_self.kr_l[il]->data + c.cpy->view_offs;
+        c.cpy->data         = c.cpy->src[1]->data;
+    }
     return true;
+}
+
+static std::vector<llama_context *> & llama_all_contexts() {
+    static std::vector<llama_context *> contexts;
+    return contexts;
 }
 
 llama_context::llama_context(const llama_model & model)
@@ -702,6 +729,10 @@ llama_context::llama_context(const llama_model & model)
     } else {
         cache_copies.resize(2*hparams.n_layer);
     }
+    // GLM-DSA lightning indexer: one indexer-key (kr_l) cache copy per layer. Entries stay null
+    // for non-DSA models / non-indexer layers, so update_cache_copies() is a no-op when DSA is off.
+    dsa_cache_copies.resize(hparams.n_layer);
+    llama_all_contexts().push_back(this);
 }
 
 void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
@@ -722,6 +753,14 @@ llama_context::~llama_context() {
     }
 
     ggml_backend_buffer_free(buf_output);
+
+    auto & all_contexts = llama_all_contexts();
+    for (auto it = all_contexts.begin(); it != all_contexts.end(); ++it) {
+        if (*it == this) {
+            all_contexts.erase(it);
+            break;
+        }
+    }
 }
 
 int llama_context::max_nodes(int n_tokens, int n_kv) const {
@@ -815,6 +854,7 @@ static bool llama_kv_cache_init(
                const llama_context * ctx,
                          ggml_type   type_k,
                          ggml_type   type_v,
+                         ggml_type   idx_type_k,
                           uint32_t   kv_size,
                               bool   offload,
                           ggml_type  type_k_first,
@@ -880,7 +920,7 @@ static bool llama_kv_cache_init(
     std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
     if (offload) {
         const bool is_mtp = (model.arch == LLM_ARCH_GLM_DSA ||
-                             model.arch == LLM_ARCH_QWEN35 ||
+                             //model.arch == LLM_ARCH_QWEN35 ||
                              model.arch == LLM_ARCH_QWEN35MOE) && hparams.nextn_predict_layers > 0;
         const int64_t n_mtp_first = hparams.n_layer - hparams.nextn_predict_layers;
         for (int64_t i = 0; i < n_layer; ++i) {
@@ -950,6 +990,13 @@ static bool llama_kv_cache_init(
     if (needs_v_cache) cache.v_l.reserve(n_layer);
     cache.s_l.resize(n_layer, nullptr);
 
+    // DSA lightning-indexer key cache: one [indexer_head_size, kv_size] tensor per layer.
+    // Allocated below (in the MLA branch) only when the model carries the indexer tensors.
+    const bool has_dsa_indexer = model.arch == LLM_ARCH_GLM_DSA && hparams.indexer_head_size > 0;
+    if (has_dsa_indexer) {
+        cache.kr_l.resize(n_layer, nullptr);
+    }
+
     std::vector<size_t> mem_split(model.splits.size(), 0);
 
     const uint32_t qnext_state_slots = llama_qwen3next_state_slots(cparams, kv_size);
@@ -960,10 +1007,10 @@ static bool llama_kv_cache_init(
 
     int n_mla = 0;
     int n_kv_active_layers = 0;
-    const int64_t n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
+    const int n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < (int) n_layer; i++) {
         // For MTP-only context, skip KV allocation for non-MTP layers
-        if (cparams.mtp_op_type != MTP_OP_NONE && i < (int)n_mtp_first_layer) {
+        if (cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first_layer) {
             cache.k_l.push_back(nullptr);
             if (!is_mla_attn || !cparams.mla_attn || (cparams.mla_attn == 1 && !cparams.flash_attn)) {
                 cache.v_l.push_back(nullptr);
@@ -976,10 +1023,10 @@ static bool llama_kv_cache_init(
         const uint32_t n_head_kv    = hparams.n_head_kv(i);
         const uint32_t n_embd_head_k= hparams.n_embd_head_k(i);
 
-        const bool is_mtp_tail_layer = (model.arch == LLM_ARCH_QWEN35 ||
+        const bool is_mtp_tail_layer = (//model.arch == LLM_ARCH_QWEN35 ||
                                         model.arch == LLM_ARCH_QWEN35MOE ||
                                         model.arch == LLM_ARCH_GLM_DSA) &&
-                hparams.nextn_predict_layers > 0 && i >= (int)n_mtp_first_layer;
+                hparams.nextn_predict_layers > 0 && i >= n_mtp_first_layer;
         //struct ggml_context * ctx = split_cache && !qnext_recurrent ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
         struct ggml_context * ctx = ((split_cache || replicate_mla) && !is_mtp_tail_layer) ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
         ggml_tensor * k = nullptr;
@@ -995,6 +1042,13 @@ static bool llama_kv_cache_init(
             ggml_tensor * kv = ggml_new_tensor_2d(ctx, primary_kv_type, kv_lora_rank + n_embd_head_qk_rope, kv_size);
             ggml_format_name(kv, "cache_k_l%d", i);
             cache.k_l.push_back(kv);
+            // DSA lightning-indexer key cache (MQA, single head). Store the Hadamard-rotated
+            // indexer keys in F16 so a decoded token can score against ALL past keys.
+            if (has_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] && !is_mtp_tail_layer) {
+                ggml_tensor * kr = ggml_new_tensor_2d(ctx, idx_type_k, hparams.indexer_head_size, kv_size);
+                ggml_format_name(kr, "cache_kr_l%d", i);
+                cache.kr_l[i] = kr;
+            }
             if (!cparams.flash_attn && cparams.mla_attn == 1) {
                 ggml_tensor * kvt = ggml_new_tensor_1d(ctx, cache.type_v, kv_lora_rank*kv_size);
                 ggml_format_name(kvt, "cache_v_l%d", i);
@@ -3118,6 +3172,8 @@ static bool is_model_split_supported(const llama_model & model) {
         LLM_ARCH_QWEN35,
         LLM_ARCH_QWEN35MOE,
         LLM_ARCH_GEMMA4,
+        LLM_ARCH_GEMMA4_MTP,
+        LLM_ARCH_GEMMA4_ASSISTANT,
         LLM_ARCH_DEEPSEEK2,
         LLM_ARCH_GLM_DSA,
         LLM_ARCH_MISTRAL4,
@@ -3199,7 +3255,9 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             }
         }
         if (name == "mtp_pre_proj.weight"  || name == "mtp_post_proj.weight" ||
-            name == "mtp_centroids.weight" || name == "mtp_token_ordering.weight") {
+            name == "mtp_centroids.weight" || name == "mtp_token_ordering.weight" ||
+            name == "nextn.post_projection.weight" || name == "nextn.pre_projection.weight" ||
+            name == "rope_freqs.weight") {
             continue;
         }
         if (name == "dflash_fc.weight" || name == "dflash_hidden_norm.weight") {
@@ -3394,11 +3452,21 @@ static bool llm_load_tensors(
 
     auto & hparams = model.hparams;
 
+    if (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        auto & all_models = llama_all_loaded_models();
+        llama_model * tgt_model = nullptr;
+        for (auto model : all_models) {
+            if (model->arch == LLM_ARCH_GEMMA4) {
+                tgt_model = model;
+            }
+        }
+        if (tgt_model) {
+            split_mode = tgt_model->split_mode;
+        }
+    }
+
     if (split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) {
-        const bool unsupported_gemma_split =
-            model.arch == LLM_ARCH_GEMMA4_MTP ||
-            model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
-            (model.arch == LLM_ARCH_GEMMA4 && hparams.n_embd_per_layer > 0);
+        const bool unsupported_gemma_split = model.arch == LLM_ARCH_GEMMA4 && hparams.n_embd_per_layer > 0;
 
         if (unsupported_gemma_split) {
             LLAMA_LOG_WARN("\n=========================================================\n");
@@ -3422,6 +3490,25 @@ static bool llm_load_tensors(
                 LLAMA_LOG_WARN("================================================================\n\n");
                 max_gpu = 4;
             }
+        }
+    }
+    if ((split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) &&
+        (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT)) {
+        auto & all_models = llama_all_loaded_models();
+        bool has_target_gemma = false;
+        for (auto model : all_models) {
+            if (model->arch == LLM_ARCH_GEMMA4) {
+                has_target_gemma = true;
+                break;
+            }
+        }
+        if (!has_target_gemma) {
+            LLAMA_LOG_WARN("\n=======================================================\n");
+            LLAMA_LOG_WARN("Split mode 'graph' requested for Gemma4-assistant model\n");
+            LLAMA_LOG_WARN("but no loaded Gemma4 model found.\n");
+            LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
+            LLAMA_LOG_WARN("=======================================================\n\n");
+            split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
     }
 
@@ -3542,7 +3629,12 @@ static bool llm_load_tensors(
     model.default_layer_device = std::vector<int32_t>(hparams.n_layer+1, device_count-1);
     int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
     std::vector<llama_model_tensor_buft_override> overrides;
-    if (device_count > 0) {
+    // device_count comes from model.splits (at least 1), but device_mem below is sized by
+    // model.devices, which is empty on a CPU-only run of a CUDA build (no GPU present or
+    // -ngl 0). This block indexes device_mem[id] for id < device_count, so it reads out of
+    // bounds and crashes unless we also require a non-empty GPU device list. CPU-only
+    // placement is already handled above, so skipping this block is safe.
+    if (device_count > 0 && !model.devices.empty()) {
         std::vector<expert_tensors> experts;
         auto [layer_sizes, max_compute] = get_layer_sizes(ml, model, cache_type_k, cache_type_v, max_ctx_size, mla_attn, n_seq_max, n_ubatch,
                 amb, worst_case_tokens, flash_attn, experts);
@@ -3994,7 +4086,7 @@ static bool llm_load_tensors(
         for (auto & it : ctx_bufs) {
             ggml_context * ctx = it.first;
             auto & bufs = it.second;
-            if (!ml.load_all_data(ctx, bufs, use_mlock ? &model.mlock_mmaps : NULL, progress_callback, progress_callback_user_data)) {
+            if (!ml.load_all_data(ctx, &model, bufs, use_mlock ? &model.mlock_mmaps : NULL, progress_callback, progress_callback_user_data)) {
                 return false;
             }
         }
@@ -4189,6 +4281,11 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         )) {
             return -2;
         }
+
+        // ---- populate reload registry ONLY when hot-swap is requested ----
+        if (std::getenv("LLAMA_HOTSWAP_ENABLED") != nullptr) {
+            model.reload = std::make_unique<reload_info>(ml);
+				}
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;
@@ -4257,6 +4354,58 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     const auto & hparams = lctx.model.hparams;
     const auto & cparams = lctx.cparams;
     const auto & kv_self = lctx.kv_self;
+
+    if (lctx.inp_dsa_sink) {
+        // Per-sequence attention-sink boost for the DSA lightning indexer top-k selection.
+        // inp_dsa_sink {n_kv, n_tokens}: 1e20 iff key cell i is one of query j's sequence's FIRST
+        // n_sink present tokens, else 0. Filled from kv_self.cells like the KQ_mask so it is correct
+        // for multi-sequence ubatches (each sequence's OWN sink is force-included).
+        //
+        // SERVING FIX: anchor the sink on each sequence's FIRST PRESENT position, not absolute
+        // pos < n_sink. After multi-turn seq_rm drops a sequence's early tokens, its earliest
+        // surviving token has pos >= n_sink; an absolute "pos < n_sink" test would then protect
+        // NOTHING for that sequence and let the (now-)sink token be masked out of top-k, collapsing
+        // it. Anchoring on per-sequence min(pos) keeps the sink protection following the sequence's
+        // actual first present cell. For a fresh sequence starting at pos 0, min(pos)==0 so the
+        // boosted set is identical to the old behaviour (n_seq==1 byte-identical).
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_dsa_sink->buffer));
+        static const int n_sink = []{ const char * e = getenv("DSA_SINK"); return e ? atoi(e) : 1; }();
+        const int64_t n_kv      = lctx.inp_dsa_sink->ne[0];
+        const int64_t n_tok_idx = lctx.inp_dsa_sink->ne[1];
+        float * data = (float *) lctx.inp_dsa_sink->data;
+        std::memset(data, 0, ggml_nbytes(lctx.inp_dsa_sink));
+
+        // Per-sequence first present pos: min over present cells of that seq, restricted to the
+        // n_kv key span the indexer scores. Cache across query rows in this ubatch.
+        // ASSUMPTION (latent today): min(pos) over the whole [0,n_kv) span equals the sequence's
+        // genuine first-present token only for a NON-SLIDING cache. GLM_DSA has no SWA, so the
+        // oldest cell of a seq is its true sink; if SWA were ever added, the window could evict the
+        // real sink and min(pos) would anchor on the wrong (window-floor) cell — revisit then.
+        std::unordered_map<llama_seq_id, llama_pos> seq_min_pos;
+        for (int64_t i = 0; i < n_kv; ++i) {
+            const auto & cell = kv_self.cells[i];
+            if (cell.pos < 0) continue;
+            for (const llama_seq_id sid : cell.seq_id) {
+                auto it = seq_min_pos.find(sid);
+                if (it == seq_min_pos.end() || cell.pos < it->second) {
+                    seq_min_pos[sid] = cell.pos;
+                }
+            }
+        }
+
+        for (int64_t j = 0; j < n_tok_idx && j < (int64_t) batch.n_tokens; ++j) {
+            const llama_seq_id seq_id = batch.seq_id[j][0];
+            auto it = seq_min_pos.find(seq_id);
+            if (it == seq_min_pos.end()) continue;  // no present cell for this seq in the key span
+            const llama_pos first_pos = it->second;
+            for (int64_t i = 0; i < n_kv; ++i) {
+                const auto & cell = kv_self.cells[i];
+                if (cell.pos >= first_pos && cell.pos < first_pos + n_sink && cell.has_seq_id(seq_id)) {
+                    data[j*n_kv + i] = 1e20f;
+                }
+            }
+        }
+    }
 
     if (batch.token && lctx.inp_tokens) {
 #if IK_PRINT_TIMING == 2
@@ -5114,16 +5263,6 @@ static bool prepare_mtp_graph_inputs(
     return true;
 }
 
-static bool dflash_layer_has_attention_bias(const llama_layer & layer) {
-    return layer.bq != nullptr ||
-           layer.bk != nullptr ||
-           layer.bv != nullptr ||
-           layer.bo != nullptr ||
-           layer.bqkv != nullptr ||
-           layer.bqk != nullptr ||
-           layer.bkv != nullptr;
-}
-
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -5519,9 +5658,6 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
-        if (lctx.dflash.kv.workspace_sync_pending) {
-            llama_sync_dflash_workspace_if_pending(lctx);
-        }
         llama_graph_compute(lctx, gf, n_threads);
 #if IK_PRINT_TIMING
         llama_synchronize(&lctx);
@@ -5919,7 +6055,12 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     //   - x2 for keys and values
     //const uint32_t max_moves = model.max_nodes()/(6*n_layer);
     // TODO: tmp fix https://github.com/ggerganov/llama.cpp/issues/6685#issuecomment-2057579516
-    const uint32_t max_moves = (lctx.model.max_nodes(1) - 2*n_layer)/(6*n_layer);
+    // DSA: build_defrag additionally moves the indexer-key cache (kr_l), +3 tensors/layer/move
+    // (src view, dst view, copy), so budget 9*n_layer per move when the indexer cache is present.
+    const bool has_dsa_indexer_defrag =
+        lctx.model.arch == LLM_ARCH_GLM_DSA && !kv_self.kr_l.empty();
+    const uint32_t tensors_per_move = has_dsa_indexer_defrag ? 9 : 6;
+    const uint32_t max_moves = (lctx.model.max_nodes(1) - 2*n_layer)/(tensors_per_move*n_layer);
 
     // determine which KV cells to move where
     //
@@ -6443,6 +6584,7 @@ struct llama_model_params llama_model_default_params() {
         /*.ncmoe                       =*/ 0,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.idx_type_k                  =*/ GGML_TYPE_F16,
         /*.max_ctx_size                =*/ 0,
         /*.n_seq_max                   =*/ 1,
         /*.n_ubatch                    =*/ 512,
@@ -6515,6 +6657,7 @@ struct llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.idx_type_k                  =*/ GGML_TYPE_F16,
         /*.type_reduce                 =*/ GGML_TYPE_F16,
         /*.type_graph_attn             =*/ GGML_TYPE_F16,
         /*.type_first_k                =*/ GGML_TYPE_F16,
@@ -6537,6 +6680,8 @@ struct llama_context_params llama_context_default_params() {
         /*.fused_mmad                  =*/ true,
         /*.rope_cache                  =*/ false,
         /*.graph_reuse                 =*/ true,
+        /*.dsa                         =*/ false,
+        /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
         /*.only_active_experts         =*/ false,
@@ -6758,10 +6903,19 @@ struct llama_model * llama_model_load_from_file(
         return nullptr;
     }
 
+    llama_all_loaded_models().push_back(model);
+
     return model;
 }
 
 void llama_free_model(struct llama_model * model) {
+    auto & all_models = llama_all_loaded_models();
+    for (auto it = all_models.begin(); it != all_models.end(); ++it) {
+        if (*it == model) {
+            all_models.erase(it);
+            break;
+        }
+    }
     delete model;
 }
 
@@ -7158,6 +7312,14 @@ struct llama_context * llama_init_from_model(
     cparams.fused_mmad       = params.fused_mmad;
     cparams.rope_cache       = params.rope_cache;
     cparams.graph_reuse      = params.graph_reuse;
+    cparams.dsa              = params.dsa;
+    cparams.dsa_top_k        = params.dsa_top_k;
+    // The DSA lightning indexer is built only in the layer-mode (non-TP) attention path. Under
+    // -sm graph / -sm attn the model runs the tensor-parallel attention path, which has no indexer,
+    // so --dsa would silently run dense MLA. Warn instead of degrading silently.
+    if (cparams.dsa && (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN)) {
+        LLAMA_LOG_WARN("%s: --dsa is not active under -sm graph/attn (tensor-parallel attention has no indexer); running dense MLA\n", __func__);
+    }
     cparams.k_cache_hadamard = params.k_cache_hadamard;
     cparams.v_cache_hadamard = params.v_cache_hadamard;
     // Folding H into wv_b/wk_b_pp permanently mutates the model; a later context
@@ -7343,7 +7505,7 @@ struct llama_context * llama_init_from_model(
         // main_gpu is a local index into model->devices throughout the codebase
         // (auto-fit assigns device_count-1, MTP clamps to [0, device_count), buffer-type
         // setup wraps with model.devices[main_gpu]). Translate to a raw device id here.
-        const int main_gpu_id = (model->main_gpu >= 0 && model->main_gpu < (int)model->devices.size())
+        [[maybe_unused]] const int main_gpu_id = (model->main_gpu >= 0 && model->main_gpu < (int)model->devices.size())
             ? model->devices[model->main_gpu]
             : model->main_gpu;
 #if defined(GGML_USE_METAL)
@@ -7359,7 +7521,7 @@ struct llama_context * llama_init_from_model(
 #elif defined(GGML_USE_CUDA)
         if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
             // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
-            ggml_backend_t backend = ggml_backend_cuda_init(main_gpu_id, cparams.cuda_params);
+            ggml_backend_t backend = ggml_backend_cuda_init(main_gpu_id, cparams.cuda_params, ctx);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize CUDA%d backend\n", __func__, main_gpu_id);
                 llama_free(ctx);
@@ -7378,7 +7540,7 @@ struct llama_context * llama_init_from_model(
                 params = new_params.data();
             }
             for (int device = 0; device < ggml_backend_cuda_get_device_count(); ++device) {
-                ggml_backend_t backend = ggml_backend_cuda_init(device, params);
+                ggml_backend_t backend = ggml_backend_cuda_init(device, params, ctx);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize CUDA%d backend\n", __func__, device);
                     llama_free(ctx);
@@ -7505,7 +7667,7 @@ struct llama_context * llama_init_from_model(
         }
         ctx->backends.push_back(ctx->backend_cpu);
 
-        if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, kv_size, cparams.offload_kqv,
+        if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
                     params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
@@ -7516,10 +7678,16 @@ struct llama_context * llama_init_from_model(
         {
             size_t memory_size_k = 0;
             size_t memory_size_v = 0;
+            size_t memory_size_k_indexer = 0;
 
             for (auto & k : ctx->kv_self.k_l) {
                 if (k) {
                     memory_size_k += ggml_nbytes(k);
+                }
+            }
+            for (auto & k : ctx->kv_self.kr_l) {
+                if (k) {
+                    memory_size_k_indexer += ggml_nbytes(k);
                 }
             }
 
@@ -7529,8 +7697,8 @@ struct llama_context * llama_init_from_model(
                 }
             }
 
-            if (memory_size_k + memory_size_v > 0) {
-	        if (cparams.mla_attn != 0 && !cparams.flash_attn) {
+            if (memory_size_k + memory_size_v) {
+	            if (cparams.mla_attn != 0 && !cparams.flash_attn) {
                     LLAMA_LOG_INFO("%s: KV self size  = %7.2f MiB, c^KV (%s): %7.2f MiB, kv^T (%s): %7.2f MiB\n", __func__,
                             (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f),
                             ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
@@ -7545,6 +7713,10 @@ struct llama_context * llama_init_from_model(
                             ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                             ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
                 }
+            }
+            if (memory_size_k_indexer > 0) {
+                LLAMA_LOG_INFO("%s: KV self indexer size = %7.2f MiB (%s)\n", __func__, memory_size_k_indexer/1024./1024.,
+                        ggml_type_name(params.idx_type_k));
             }
         }
 
@@ -11344,4 +11516,23 @@ void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_conte
 
 size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts) {
     return unicode_fill_from_utf8((std::string*)utf8, (std::vector<uint32_t>*)cpts, (std::vector<std::string>*)scripts);
+}
+
+
+bool llama_reload_changed_tensors(struct llama_context * ctx) {
+    if (!ctx) return false;
+    llama_model & model = const_cast<llama_model &>(ctx->model);
+    if (!model.reload) return false;
+    bool result = model.reload->reload_changed_tensors(model);
+    if (result) {
+        // Reset cached compute graphs so they are rebuilt with new tensor pointers/sizes
+        ctx->prev.reset();
+        ctx->prev_mtp.reset();
+    }
+    return result;
+}
+
+std::vector<llama_model *> & llama_all_loaded_models() {
+    static std::vector<llama_model *> models;
+    return models;
 }

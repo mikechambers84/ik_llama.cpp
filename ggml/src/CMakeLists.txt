@@ -6,6 +6,9 @@ add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 if (GGML_MAX_CONTEXTS)
     add_compile_definitions(GGML_MAX_CONTEXTS=${GGML_MAX_CONTEXTS})
 endif()
+if (GGML_MAX_SRC)
+  add_compile_definitions(GGML_MAX_SRC=${GGML_MAX_SRC})
+endif()
 
 # enable libstdc++ assertions for debug builds
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -1089,7 +1092,7 @@ if (GGML_CUDA)
 
         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
     endif()
-	
+
     if (GGML_FATAL_WARNINGS)
         list(APPEND CUDA_FLAGS -Werror all-warnings)
     endif()
@@ -1130,6 +1133,10 @@ if (GGML_CUDA)
 
     if (NOT MSVC)
         list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+    else()
+        # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
+        # https://github.com/NVIDIA/cccl/pull/6827
+        list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
     endif()
 endif()
 
@@ -1250,6 +1257,9 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
         endif()
         if (GGML_SVE)
             list(APPEND ARCH_FLAGS -march=armv8.6-a+sve)
+        endif()
+        if (GGML_NATIVE)
+            list(APPEND ARCH_FLAGS -march=native)
         endif()
         if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
             # else we fail on Gravitons and such
